@@ -34,6 +34,28 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
     # Create monthly period (timestamp at month start)
     df['PeriodMonth'] = df[date_col].dt.to_period('M').dt.to_timestamp()
 
+    # Attach fiscal quarter start and label to each row for later per-quarter sheets
+    def _fiscal_quarter_info_row(ts):
+        # ts is a Timestamp at month start
+        m = int(ts.month)
+        y = int(ts.year)
+        fy = y if m != 1 else y - 1
+        if m in (2, 3, 4):
+            start_month = 2
+            q = 1
+        elif m in (5, 6, 7):
+            start_month = 5
+            q = 2
+        elif m in (8, 9, 10):
+            start_month = 8
+            q = 3
+        else:
+            start_month = 11
+            q = 4
+        return pd.Timestamp(year=fy, month=start_month, day=1), f"FY{fy}-Q{q}"
+
+    df[['FiscalQuarterStart', 'FiscalQuarterLabel']] = df['PeriodMonth'].apply(lambda ts: pd.Series(list(_fiscal_quarter_info_row(ts))))
+
     if value_col not in df.columns:
         raise ValueError(f"Value column '{value_col}' not found in input. Available: {list(df.columns)}")
 
@@ -43,6 +65,56 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
     pct = monthly.pct_change().fillna(0).rename('MoM_Pct') * 100
 
     summary = pd.concat([monthly, flux, pct], axis=1)
+
+    # Fiscal-quarter aggregation (fiscal year starts in February)
+    # Mapping: Feb-Apr => Q1, May-Jul => Q2, Aug-Oct => Q3, Nov-Jan => Q4
+    def _fiscal_quarter_info(ts: pd.Timestamp):
+        m = int(ts.month)
+        y = int(ts.year)
+        if m == 1:
+            fy = y - 1
+        else:
+            fy = y
+        if m in (2, 3, 4):
+            q = 1
+            start_month = 2
+        elif m in (5, 6, 7):
+            q = 2
+            start_month = 5
+        elif m in (8, 9, 10):
+            q = 3
+            start_month = 8
+        else:
+            q = 4
+            start_month = 11
+        # Quarter identifier and a sortable timestamp representing quarter start
+        quarter_label = f"FY{fy}-Q{q}"
+        quarter_start = pd.Timestamp(year=fy, month=start_month, day=1)
+        return quarter_start, quarter_label
+
+    # Build quarterly series by mapping each month to its fiscal quarter
+    q_map = {}
+    for ts, amt in monthly.items():
+        qs, qlabel = _fiscal_quarter_info(ts)
+        if qs in q_map:
+            q_map[qs]['Amount'] += float(amt)
+        else:
+            q_map[qs] = {'Amount': float(amt), 'QuarterLabel': qlabel}
+
+    if q_map:
+        q_items = sorted(q_map.items(), key=lambda x: x[0])
+        quarter_index = [k for k, v in q_items]
+        quarter_amounts = pd.Series([v['Amount'] for k, v in q_items], index=quarter_index).rename('Amount')
+        q_flux = quarter_amounts.diff().fillna(0).rename('QoQ_Flux')
+        q_pct = quarter_amounts.pct_change().fillna(0).rename('QoQ_Pct') * 100
+        quarter_summary = pd.concat([quarter_amounts, q_flux, q_pct], axis=1)
+        # add readable label column
+        quarter_summary = quarter_summary.reset_index().rename(columns={'index': 'QuarterStart'})
+        quarter_summary['Quarter'] = quarter_summary['QuarterStart'].apply(lambda ts: q_map.get(ts, {}).get('QuarterLabel', str(ts)))
+        # order columns
+        quarter_summary = quarter_summary[['Quarter', 'QuarterStart', 'Amount', 'QoQ_Flux', 'QoQ_Pct']]
+    else:
+        quarter_summary = None
 
     # Save to Excel: include a Summary sheet and one sheet per month with transactions
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
@@ -56,6 +128,16 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
             summary_df.iloc[:, 0] = summary_df.iloc[:, 0].astype(str)
         summary_df.rename(columns={summary_df.columns[0]: 'Period'}, inplace=True)
         summary_df.to_excel(writer, sheet_name='Summary', index=False)
+
+        # write quarterly sheet if available
+        if quarter_summary is not None:
+            try:
+                # format QuarterStart as YYYY-MM for readability
+                q_out = quarter_summary.copy()
+                q_out['QuarterStart'] = q_out['QuarterStart'].dt.strftime('%Y-%m')
+                q_out.to_excel(writer, sheet_name='Quarterly', index=False)
+            except Exception:
+                pass
 
         # Per-month transaction sheets: filter original df for each month
         for period_ts, group in df.groupby('PeriodMonth'):
@@ -76,6 +158,24 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
                 # fallback: use a safe sheet name enumerated
                 safe_name = sheet_name[:25] + '_' + str(abs(hash(sheet_name)) % 1000)
                 group_to_write.to_excel(writer, sheet_name=safe_name, index=False)
+
+        # Per-quarter transaction sheets: group by FiscalQuarterStart and write each quarter's transactions
+        try:
+            for qstart, qgroup in df.groupby('FiscalQuarterStart'):
+                qlabel = None
+                if 'FiscalQuarterLabel' in qgroup.columns:
+                    qlabel = qgroup['FiscalQuarterLabel'].iloc[0]
+                sheet_name = (str(qlabel) if qlabel is not None else qstart.strftime('%Y-%m'))
+                sheet_name = sheet_name[:31]
+                try:
+                    q_to_write = qgroup.drop(columns=['PeriodMonth'], errors='ignore')
+                    q_to_write = q_to_write.drop(columns=['FiscalQuarterStart', 'FiscalQuarterLabel'], errors='ignore')
+                    q_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
+                except Exception:
+                    safe_name = sheet_name[:25] + '_' + str(abs(hash(sheet_name)) % 1000)
+                    q_to_write.to_excel(writer, sheet_name=safe_name, index=False)
+        except Exception:
+            pass
 
     # Chart generation and embedding removed by user request.
 
@@ -160,6 +260,31 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             except Exception:
                 continue
         months_sorted = sorted(month_groups.keys())
+        # detect quarter sheet names (FY<year>-Q<q> or YYYY-MM for quarter start labels)
+        quarter_groups = {}
+        quarter_sheet_names = [s for s in xl.sheet_names if re.match(r"^FY\d{4}-Q[1-4]$", s) or re.match(r"^\d{4}-\d{2}$", s) and any(re.match(r"^FY", t) for t in xl.sheet_names)]
+        # fallback: also include sheet named 'Quarterly'
+        if 'Quarterly' in xl.sheet_names:
+            try:
+                qdf = pd.read_excel(output_excel, sheet_name='Quarterly')
+                # build quarter_groups from that table using QuarterStart or Quarter column
+                if 'QuarterStart' in qdf.columns:
+                    for _, r in qdf.iterrows():
+                        try:
+                            ts = pd.to_datetime(str(r['QuarterStart']) + '-01')
+                            quarter_groups[ts] = None
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        for s in xl.sheet_names:
+            # accept sheet names like 'FY2025-Q1' or 'FY2025-Q2' as quarter pages
+            if re.match(r"^FY\d{4}-Q[1-4]$", s):
+                try:
+                    df_sheet = pd.read_excel(output_excel, sheet_name=s)
+                    quarter_groups[s] = df_sheet
+                except Exception:
+                    continue
     except Exception:
         months_sorted = []
 
@@ -237,8 +362,64 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
         # if anything goes wrong building the explicit mapping, continue without it
         pass
 
+    # If a quarterly sheet was produced, attempt to read it and add QoQ explicit mapping
+    try:
+        # try reading Quarterly from the output Excel if present
+        q_summary = None
+        try:
+            qdf = pd.read_excel(output_excel, sheet_name='Quarterly')
+            if not qdf.empty:
+                q_summary = qdf
+        except Exception:
+            # fallback: build from summary_df if possible
+            if 'Quarter' in summary_df.columns and 'QoQ_Flux' in summary_df.columns:
+                q_summary = summary_df[['Quarter', 'QoQ_Flux', 'QoQ_Pct']]
+        if q_summary is not None:
+            lines.append('\nQuarterly summary (fiscal quarters):')
+            # show the quarter table
+            try:
+                lines.append(q_summary.to_string(index=False))
+            except Exception:
+                lines.append(str(q_summary))
+            # explicit adjacent QoQ mapping
+            try:
+                q_lines = []
+                # expect a column named 'Quarter' or 'QuarterStart' to determine order
+                if 'QuarterStart' in q_summary.columns:
+                    q_summary['QuarterStart_ts'] = pd.to_datetime(q_summary['QuarterStart'])
+                    q_sorted = q_summary.sort_values(by='QuarterStart_ts')
+                elif 'Quarter' in q_summary.columns:
+                    q_sorted = q_summary
+                else:
+                    q_sorted = q_summary
+                for i in range(1, len(q_sorted)):
+                    prev = q_sorted.iloc[i-1]
+                    curr = q_sorted.iloc[i]
+                    prev_label = prev.get('Quarter') or str(prev.get('QuarterStart'))
+                    curr_label = curr.get('Quarter') or str(curr.get('QuarterStart'))
+                    flux = curr.get('QoQ_Flux')
+                    pct = curr.get('QoQ_Pct')
+                    try:
+                        flux_f = f"{float(flux):,.2f}"
+                    except Exception:
+                        flux_f = str(flux)
+                    try:
+                        pct_f = f"{float(pct):.1f}%"
+                    except Exception:
+                        pct_f = str(pct)
+                    q_lines.append(f"{prev_label} -> {curr_label}: QoQ_Flux: {flux_f}, QoQ_Pct: {pct_f}")
+                if q_lines:
+                    lines.append('\nExplicit adjacent-pair QoQ values:')
+                    lines.append('\n'.join(q_lines))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     memo_lines = []
     pair_lines = []
+    quarter_memo_lines = []
+    quarter_pair_lines = []
     if months_sorted:
         # per-month top memos
         for period in months_sorted:
@@ -324,6 +505,63 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             else:
                 pair_lines.append('  Memo/description column not found; cannot compute memo-level diffs for this pair.')
 
+    # Per-quarter memo analysis: if quarter_groups detected, perform analogous QoQ memo diffs
+    try:
+        if quarter_groups:
+            # determine sorted quarter keys: if keys are timestamps use them, else use sheet order
+            q_keys = list(quarter_groups.keys())
+            # if keys are timestamps, sort; otherwise keep sheet order
+            try:
+                q_sorted_keys = sorted([k for k in q_keys if isinstance(k, (pd.Timestamp, pd.DatetimeIndex))])
+            except Exception:
+                q_sorted_keys = q_keys
+            # if keys are strings (sheet names like FY2025-Q1), keep that order as found
+            for i in range(1, len(q_keys)):
+                k_prev = q_keys[i-1]
+                k_curr = q_keys[i]
+                g_prev = quarter_groups.get(k_prev)
+                g_curr = quarter_groups.get(k_curr)
+                label_prev = str(k_prev)
+                label_curr = str(k_curr)
+                quarter_pair_lines.append(f"\nChanges {label_prev} -> {label_curr}: ")
+                if g_prev is None or g_curr is None:
+                    quarter_pair_lines.append('  Quarter detail not available; skipped.')
+                    continue
+                # detect memo column in quarter groups
+                q_memo_col = None
+                lowered = {c.lower(): c for c in g_prev.columns}
+                for name in possible_memo_names:
+                    if name in g_prev.columns:
+                        q_memo_col = name
+                        break
+                    if name.lower() in lowered:
+                        q_memo_col = lowered[name.lower()]
+                        break
+                if q_memo_col and q_memo_col in g_prev.columns and q_memo_col in g_curr.columns:
+                    agg_prev = g_prev.groupby(q_memo_col)[value_col].sum()
+                    agg_curr = g_curr.groupby(q_memo_col)[value_col].sum()
+                    combined = pd.concat([agg_prev.rename('prev'), agg_curr.rename('curr')], axis=1).fillna(0)
+                    combined['delta'] = combined['curr'] - combined['prev']
+                    total_delta = combined['delta'].sum()
+                    if total_delta == 0:
+                        combined['contrib_pct_of_flux'] = 0.0
+                    else:
+                        combined['contrib_pct_of_flux'] = (combined['delta'] / total_delta) * 100
+                    top_pos = combined.sort_values(by='delta', ascending=False).head(5)
+                    top_neg = combined.sort_values(by='delta').head(5)
+                    if not top_pos.empty:
+                        quarter_pair_lines.append(' Top increases:')
+                        for idx, row in top_pos.iterrows():
+                            quarter_pair_lines.append(f"  - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                    if not top_neg.empty:
+                        quarter_pair_lines.append(' Top decreases:')
+                        for idx, row in top_neg.iterrows():
+                            quarter_pair_lines.append(f"  - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                else:
+                    quarter_pair_lines.append('  Memo/description column not found; cannot compute QoQ memo-level diffs for this pair.')
+    except Exception:
+        pass
+
     else:
         memo_lines.append('No PeriodMonth could be computed from the input; skipping memo aggregates.')
 
@@ -331,6 +569,10 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
         lines.append('\n'.join(pair_lines))
     if memo_lines:
         lines.append('\n'.join(memo_lines))
+    if quarter_pair_lines:
+        lines.append('\n'.join(quarter_pair_lines))
+    if quarter_memo_lines:
+        lines.append('\n'.join(quarter_memo_lines))
 
     prompt = '\n'.join(lines)
     # Avoid truncating the prompt aggressively in code; rely on model max_tokens instead.
