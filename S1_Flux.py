@@ -209,18 +209,33 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
         env_path = os.path.join(os.getcwd(), '.env')
         if os.path.exists(env_path):
             try:
-                with open(env_path, 'r') as f:
-                    for ln in f:
-                        ln = ln.strip()
-                        if not ln or ln.startswith('#'):
-                            continue
-                        if '=' not in ln:
-                            continue
-                        k, v = ln.split('=', 1)
-                        k = k.strip()
-                        v = v.strip().strip('"').strip("'")
-                        if k not in os.environ:
-                            os.environ[k] = v
+                # Prefer UTF-8 for .env; fall back to default if needed
+                try:
+                    with open(env_path, 'r', encoding='utf-8') as f:
+                        for ln in f:
+                            ln = ln.strip()
+                            if not ln or ln.startswith('#'):
+                                continue
+                            if '=' not in ln:
+                                continue
+                            k, v = ln.split('=', 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k not in os.environ:
+                                os.environ[k] = v
+                except Exception:
+                    with open(env_path, 'r') as f:
+                        for ln in f:
+                            ln = ln.strip()
+                            if not ln or ln.startswith('#'):
+                                continue
+                            if '=' not in ln:
+                                continue
+                            k, v = ln.split('=', 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k not in os.environ:
+                                os.environ[k] = v
             except Exception:
                 pass
 
@@ -694,7 +709,7 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
     if 'truncated_by_openai' in locals() and truncated_by_openai:
         analysis = (analysis or '') + '\n\n...[truncated by OpenAI due to max_tokens; consider increasing --openai-max-tokens or shortening prompt]'
 
-    with open('openai_analysis.txt', 'w') as f:
+    with open('openai_analysis.txt', 'w', encoding='utf-8') as f:
         f.write(analysis)
 
     try:
