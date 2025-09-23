@@ -23,7 +23,7 @@ os.makedirs(mpl_config_dir, exist_ok=True)
 os.environ["MPLCONFIGDIR"] = mpl_config_dir
 
 
-def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output_excel="summary_flux.xlsx"):
+def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output_excel="summary_flux.xlsx", include_department=False, department_col="Department"):
     df = pd.read_excel(input_file, sheet_name=sheet)
     if date_col not in df.columns:
         raise ValueError(f"Date/Period column '{date_col}' not found in input. Available: {list(df.columns)}")
@@ -173,6 +173,25 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
                 safe_name = sheet_name[:25] + '_' + str(abs(hash(sheet_name)) % 1000)
                 group_to_write.to_excel(writer, sheet_name=safe_name, index=False)
 
+            # Optionally, also create per-department sheets within each month
+            if include_department and department_col in group.columns:
+                try:
+                    for dept_value, dept_group in group.groupby(department_col):
+                        base = period_ts.strftime('%Y-%m')
+                        dept_label = str(dept_value) if pd.notna(dept_value) else 'Unknown'
+                        # Build a concise sheet name within Excel's 31 char limit
+                        candidate = f"{base}-{dept_label}"
+                        sheet_name_dept = candidate[:31]
+                        dept_out = dept_group.drop(columns=['PeriodMonth'], errors='ignore').reset_index(drop=True)
+                        try:
+                            dept_out.to_excel(writer, sheet_name=sheet_name_dept, index=False)
+                        except Exception:
+                            # Fallback: hash to avoid duplicates/length issues
+                            safe_name = (base + '-' + str(abs(hash(dept_label)) % 10000))[:31]
+                            dept_out.to_excel(writer, sheet_name=safe_name, index=False)
+                except Exception:
+                    pass
+
         # Per-quarter transaction sheets: group by FiscalQuarterStart and write each quarter's transactions
         try:
             for qstart, qgroup in df.groupby('FiscalQuarterStart'):
@@ -188,6 +207,23 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
                 except Exception:
                     safe_name = sheet_name[:25] + '_' + str(abs(hash(sheet_name)) % 1000)
                     q_to_write.to_excel(writer, sheet_name=safe_name, index=False)
+
+                # Optionally, also create per-department sheets within each quarter
+                if include_department and department_col in qgroup.columns:
+                    try:
+                        for dept_value, dept_group in qgroup.groupby(department_col):
+                            base = (str(qlabel) if qlabel is not None else qstart.strftime('%Y-%m'))
+                            dept_label = str(dept_value) if pd.notna(dept_value) else 'Unknown'
+                            candidate = f"{base}-{dept_label}"
+                            sheet_name_dept = candidate[:31]
+                            dept_out = dept_group.drop(columns=['PeriodMonth', 'FiscalQuarterStart', 'FiscalQuarterLabel'], errors='ignore').reset_index(drop=True)
+                            try:
+                                dept_out.to_excel(writer, sheet_name=sheet_name_dept, index=False)
+                            except Exception:
+                                safe_name = (base + '-' + str(abs(hash(dept_label)) % 10000))[:31]
+                                dept_out.to_excel(writer, sheet_name=safe_name, index=False)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -196,7 +232,7 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
     return summary
 
 
-def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENAI_API_KEY', date_col='Period', value_col='Amount', model=None, dry_run=False, max_tokens=None, prompt_cap=0, analysis_mode='mom'):
+def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENAI_API_KEY', date_col='Period', value_col='Amount', model=None, dry_run=False, max_tokens=None, prompt_cap=0, analysis_mode='mom', include_department=False, department_col='Department'):
     """Call OpenAI (if API key present in env) to analyze MoM fluctuations.
 
     This function prefers per-month sheets in `output_excel` (sheets named `YYYY-MM`) and
@@ -262,6 +298,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
     lines = []
     if mode == 'mom':
         lines.append("You are given monthly totals and transaction memo breakdowns. Explain the main month-over-month fluctuations and likely causes.")
+        if include_department and department_col in df_all.columns:
+            lines.append(f"The dataset includes a '{department_col}' column. Incorporate department-level context when attributing changes, and consider Department together with memo and Amount (analyze (Department, Memo, Amount) jointly).")
         try:
             lines.append("Summary table (Period, Amount, MoM_Flux, MoM_Pct):")
             lines.append(summary_df.to_string(index=False))
@@ -269,6 +307,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             pass
     elif mode == 'qoq':
         lines.append("You are given fiscal-quarter totals and (when available) quarter-level detail. Explain the main quarter-over-quarter fluctuations and likely causes.")
+        if include_department and department_col in df_all.columns:
+            lines.append(f"The dataset includes a '{department_col}' column. Incorporate department-level context when attributing changes, and consider Department together with memo and Amount (analyze (Department, Memo, Amount) jointly).")
     else:
         # Fallback to MoM if unrecognized
         mode = 'mom'
@@ -476,6 +516,10 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
     pair_lines = []
     quarter_memo_lines = []
     quarter_pair_lines = []
+    dept_lines = []
+    dept_pair_lines = []
+    dept_memo_lines = []
+    dept_memo_pair_lines = []
     if mode == 'mom' and months_sorted:
         # per-month top memos
         for period in months_sorted:
@@ -486,6 +530,28 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                     memo_lines.append(f"Top memos for {period.strftime('%Y-%m')}: ")
                     for memo_val, amt in agg.items():
                         memo_lines.append(f" - {memo_val}: {amt:.2f}")
+
+            # per-month top departments
+            if include_department and department_col in group.columns:
+                try:
+                    agg_dept = group.groupby(department_col)[value_col].sum().sort_values(ascending=False).head(10)
+                    if not agg_dept.empty:
+                        dept_lines.append(f"Top departments for {period.strftime('%Y-%m')}: ")
+                        for dept_val, amt in agg_dept.items():
+                            dept_lines.append(f" - {dept_val}: {amt:.2f}")
+                except Exception:
+                    pass
+
+            # per-month top (Department, Memo) pairs
+            if include_department and department_col in group.columns and memo_col and memo_col in group.columns:
+                try:
+                    agg_combo = group.groupby([department_col, memo_col])[value_col].sum().sort_values(ascending=False).head(10)
+                    if not agg_combo.empty:
+                        dept_memo_lines.append(f"Top (Department, Memo) for {period.strftime('%Y-%m')}: ")
+                        for (dept_val, memo_val), amt in agg_combo.items():
+                            dept_memo_lines.append(f" - ({dept_val}, {memo_val}): {amt:.2f}")
+                except Exception:
+                    pass
 
         # pairwise comparisons across all adjacent month pairs
         for i in range(1, len(months_sorted)):
@@ -561,6 +627,58 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             else:
                 pair_lines.append('  Memo/description column not found; cannot compute memo-level diffs for this pair.')
 
+            # Department-level pairwise diffs
+            if include_department and department_col in g_prev.columns and department_col in g_curr.columns:
+                try:
+                    agg_prev_d = g_prev.groupby(department_col)[value_col].sum()
+                    agg_curr_d = g_curr.groupby(department_col)[value_col].sum()
+                    combined_d = pd.concat([agg_prev_d.rename('prev'), agg_curr_d.rename('curr')], axis=1).fillna(0)
+                    combined_d['delta'] = combined_d['curr'] - combined_d['prev']
+                    total_delta_d = combined_d['delta'].sum()
+                    if total_delta_d == 0:
+                        combined_d['contrib_pct_of_flux'] = 0.0
+                    else:
+                        combined_d['contrib_pct_of_flux'] = (combined_d['delta'] / total_delta_d) * 100
+                    top_pos_d = combined_d.sort_values(by='delta', ascending=False).head(5)
+                    top_neg_d = combined_d.sort_values(by='delta').head(5)
+                    dept_pair_lines.append(' Department-level changes:')
+                    if not top_pos_d.empty:
+                        dept_pair_lines.append('  Top increases by department:')
+                        for idx, row in top_pos_d.iterrows():
+                            dept_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                    if not top_neg_d.empty:
+                        dept_pair_lines.append('  Top decreases by department:')
+                        for idx, row in top_neg_d.iterrows():
+                            dept_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                except Exception:
+                    pass
+
+            # (Department, Memo) pairwise diffs
+            if include_department and department_col in g_prev.columns and department_col in g_curr.columns and memo_col and memo_col in g_prev.columns and memo_col in g_curr.columns:
+                try:
+                    agg_prev_c = g_prev.groupby([department_col, memo_col])[value_col].sum()
+                    agg_curr_c = g_curr.groupby([department_col, memo_col])[value_col].sum()
+                    combined_c = pd.concat([agg_prev_c.rename('prev'), agg_curr_c.rename('curr')], axis=1).fillna(0)
+                    combined_c['delta'] = combined_c['curr'] - combined_c['prev']
+                    total_delta_c = combined_c['delta'].sum()
+                    if total_delta_c == 0:
+                        combined_c['contrib_pct_of_flux'] = 0.0
+                    else:
+                        combined_c['contrib_pct_of_flux'] = (combined_c['delta'] / total_delta_c) * 100
+                    top_pos_c = combined_c.sort_values(by='delta', ascending=False).head(5)
+                    top_neg_c = combined_c.sort_values(by='delta').head(5)
+                    dept_memo_pair_lines.append(' (Department, Memo) changes:')
+                    if not top_pos_c.empty:
+                        dept_memo_pair_lines.append('  Top increases by (Department, Memo):')
+                        for idx, row in top_pos_c.iterrows():
+                            dept_memo_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                    if not top_neg_c.empty:
+                        dept_memo_pair_lines.append('  Top decreases by (Department, Memo):')
+                        for idx, row in top_neg_c.iterrows():
+                            dept_memo_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                except Exception:
+                    pass
+
     # Per-quarter memo analysis: if quarter_groups detected, perform analogous QoQ memo diffs
     if mode == 'qoq':
         try:
@@ -624,6 +742,14 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             lines.append('\n'.join(pair_lines))
         if memo_lines:
             lines.append('\n'.join(memo_lines))
+        if include_department and dept_lines:
+            lines.append('\n'.join(dept_lines))
+        if include_department and dept_pair_lines:
+            lines.append('\n'.join(dept_pair_lines))
+        if include_department and dept_memo_lines:
+            lines.append('\n'.join(dept_memo_lines))
+        if include_department and dept_memo_pair_lines:
+            lines.append('\n'.join(dept_memo_pair_lines))
     if mode == 'qoq':
         if quarter_pair_lines:
             lines.append('\n'.join(quarter_pair_lines))
@@ -756,6 +882,14 @@ def main():
         ai_choice = ''
     should_analyze = ai_choice in ('y', 'yes', '1', 'true', 't')
 
+    # Ask whether to refine by Department
+    try:
+        dept_choice = input("Analysis by Department? (y/N): ").strip().lower()
+    except EOFError:
+        dept_choice = ''
+    include_department = dept_choice in ('y', 'yes', '1', 'true', 't')
+    department_col = 'Department'
+
     analysis_mode = 'mom'
     if should_analyze:
         print("Choose analysis mode: [1] Month-over-Month (MoM), [2] Quarter-over-Quarter (QoQ)")
@@ -765,7 +899,7 @@ def main():
             mode_choice = ''
         analysis_mode = 'qoq' if mode_choice == '2' else 'mom'
 
-    summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel)
+    summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col)
     print('Summary:')
     print(summary.to_string())
     print(f"Saved Excel to {output_excel}")
@@ -777,7 +911,7 @@ def main():
             print('Failed to read input file for OpenAI analysis:', e)
             df_all = None
         if df_all is not None:
-            perform_openai_analysis(output_excel, df_all, summary, model=None, max_tokens=None, prompt_cap=0, analysis_mode=analysis_mode)
+            perform_openai_analysis(output_excel, df_all, summary, model=None, max_tokens=None, prompt_cap=0, analysis_mode=analysis_mode, include_department=include_department, department_col=department_col)
 
 
 if __name__ == '__main__':
