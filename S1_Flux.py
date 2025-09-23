@@ -6,6 +6,13 @@ Read an Excel file, summarize the `Amount` column by monthly `Period`,
 compute month-over-month flux and percent change, save a summary Excel,
 and create a month-over-month chart (Amount and MoM flux).
 """
+import sys
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 import os
 import pandas as pd
 
@@ -618,7 +625,7 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
     if cap > 0 and len(prompt) > cap:
         prompt = prompt[:cap] + '\n...[truncated by tool]'
 
-    default_model = 'gpt-4.1-2025-04-14'
+    default_model = 'gpt-5-2025-08-07'
     model = model or os.environ.get('OPENAI_MODEL') or default_model
     mode_label = 'month-over-month' if mode == 'mom' else 'quarter-over-quarter'
     print(f'Calling OpenAI model {model} to analyze {mode_label} fluctuations (this may incur usage). max_tokens={max_tokens or "unlimited"}')
@@ -716,8 +723,8 @@ def main():
     default_value_col = 'Amount'
     output_excel = 'summary_flux.xlsx'
 
-    print('Summarize Amount by Period')
-    print('')
+    print('Welcome to the Great P&L Flux Analyzer! This file is to analyze the flux of the P&L only, not the balance sheet or cash flow.')
+    print('If you have issues or questions, please contact Ray Sang')
     try:
         input_path = input(f"Enter Excel filename to analyze (default '{default_input}'): ").strip()
     except EOFError:
