@@ -17,16 +17,39 @@ import os
 import pandas as pd
 
 
-# (No charting libraries required) keep environment tidy
-mpl_config_dir = os.path.join(os.getcwd(), ".mplconfig")
-os.makedirs(mpl_config_dir, exist_ok=True)
-os.environ["MPLCONFIGDIR"] = mpl_config_dir
-
-
-def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output_excel="summary_flux.xlsx", include_department=False, department_col="Department"):
+def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output_excel="summary_flux.xlsx", include_department=False, department_col="Department", include_class=False, class_col="Class"):
     df = pd.read_excel(input_file, sheet_name=sheet)
+
+    # Enforce required columns: Period (date_col), Amount (value_col), and Memo-like column
+    missing = []
     if date_col not in df.columns:
-        raise ValueError(f"Date/Period column '{date_col}' not found in input. Available: {list(df.columns)}")
+        missing.append(date_col)
+    if value_col not in df.columns:
+        missing.append(value_col)
+    if include_department and department_col not in df.columns:
+        missing.append(department_col)
+    if include_class and class_col not in df.columns:
+        missing.append(class_col)
+
+    # Detect memo/description column (required)
+    memo_col_required = None
+    possible_memo_names = ['Memo', 'memo', 'MEMO', 'Description', 'description', 'DESC', 'Details', 'details', 'Notes', 'notes']
+    for c in df.columns:
+        if c in possible_memo_names:
+            memo_col_required = c
+            break
+    if memo_col_required is None:
+        lowered = {c.lower(): c for c in df.columns}
+        for name in possible_memo_names:
+            if name.lower() in lowered:
+                memo_col_required = lowered[name.lower()]
+                break
+    if memo_col_required is None:
+        missing.append('Memo (or Description/Details/Notes)')
+
+    if missing:
+        raise ValueError(f"Required column(s) missing: {', '.join(missing)}. Available columns: {list(df.columns)}")
+    # At this point required columns were validated above
 
     # Parse dates (coerce invalids)
     df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
@@ -68,8 +91,7 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
 
     df[['FiscalQuarterStart', 'FiscalQuarterLabel']] = df['PeriodMonth'].apply(lambda ts: pd.Series(list(_fiscal_quarter_info_row(ts))))
 
-    if value_col not in df.columns:
-        raise ValueError(f"Value column '{value_col}' not found in input. Available: {list(df.columns)}")
+    # Amount existence validated above
 
     # Aggregate
     monthly = df.groupby('PeriodMonth', sort=True)[value_col].sum().rename('Amount')
@@ -192,6 +214,23 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
                 except Exception:
                     pass
 
+            # Optionally, also create per-class sheets within each month
+            if include_class and class_col in group.columns:
+                try:
+                    for class_value, class_group in group.groupby(class_col):
+                        base = period_ts.strftime('%Y-%m')
+                        class_label = str(class_value) if pd.notna(class_value) else 'Unknown'
+                        candidate = f"{base}-{class_label}"
+                        sheet_name_class = candidate[:31]
+                        class_out = class_group.drop(columns=['PeriodMonth'], errors='ignore').reset_index(drop=True)
+                        try:
+                            class_out.to_excel(writer, sheet_name=sheet_name_class, index=False)
+                        except Exception:
+                            safe_name = (base + '-' + str(abs(hash(class_label)) % 10000))[:31]
+                            class_out.to_excel(writer, sheet_name=safe_name, index=False)
+                except Exception:
+                    pass
+
         # Per-quarter transaction sheets: group by FiscalQuarterStart and write each quarter's transactions
         try:
             for qstart, qgroup in df.groupby('FiscalQuarterStart'):
@@ -224,6 +263,23 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
                                 dept_out.to_excel(writer, sheet_name=safe_name, index=False)
                     except Exception:
                         pass
+
+                # Optionally, also create per-class sheets within each quarter
+                if include_class and class_col in qgroup.columns:
+                    try:
+                        for class_value, class_group in qgroup.groupby(class_col):
+                            base = (str(qlabel) if qlabel is not None else qstart.strftime('%Y-%m'))
+                            class_label = str(class_value) if pd.notna(class_value) else 'Unknown'
+                            candidate = f"{base}-{class_label}"
+                            sheet_name_class = candidate[:31]
+                            class_out = class_group.drop(columns=['PeriodMonth', 'FiscalQuarterStart', 'FiscalQuarterLabel'], errors='ignore').reset_index(drop=True)
+                            try:
+                                class_out.to_excel(writer, sheet_name=sheet_name_class, index=False)
+                            except Exception:
+                                safe_name = (base + '-' + str(abs(hash(class_label)) % 10000))[:31]
+                                class_out.to_excel(writer, sheet_name=safe_name, index=False)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -232,7 +288,7 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
     return summary
 
 
-def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENAI_API_KEY', date_col='Period', value_col='Amount', model=None, dry_run=False, max_tokens=None, prompt_cap=0, analysis_mode='mom', include_department=False, department_col='Department'):
+def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENAI_API_KEY', date_col='Period', value_col='Amount', model=None, dry_run=False, max_tokens=None, prompt_cap=0, analysis_mode='mom', include_department=False, department_col='Department', include_class=False, class_col='Class'):
     """Call OpenAI (if API key present in env) to analyze MoM fluctuations.
 
     This function prefers per-month sheets in `output_excel` (sheets named `YYYY-MM`) and
@@ -300,6 +356,12 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
         lines.append("You are given monthly totals and transaction memo breakdowns. Explain the main month-over-month fluctuations and likely causes.")
         if include_department and department_col in df_all.columns:
             lines.append(f"The dataset includes a '{department_col}' column. Incorporate department-level context when attributing changes, and consider Department together with memo and Amount (analyze (Department, Memo, Amount) jointly).")
+        if include_department and department_col not in df_all.columns:
+            lines.append(f"Note: '{department_col}' column not found; skipping Department-level analysis.")
+        if include_class and class_col in df_all.columns:
+            lines.append(f"The dataset includes a '{class_col}' column. Incorporate class-level context when attributing changes, and consider Class together with memo and Amount (analyze (Class, Memo, Amount) jointly).")
+        if include_class and class_col not in df_all.columns:
+            lines.append(f"Note: '{class_col}' column not found; skipping Class-level analysis.")
         try:
             lines.append("Summary table (Period, Amount, MoM_Flux, MoM_Pct):")
             lines.append(summary_df.to_string(index=False))
@@ -309,6 +371,12 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
         lines.append("You are given fiscal-quarter totals and (when available) quarter-level detail. Explain the main quarter-over-quarter fluctuations and likely causes.")
         if include_department and department_col in df_all.columns:
             lines.append(f"The dataset includes a '{department_col}' column. Incorporate department-level context when attributing changes, and consider Department together with memo and Amount (analyze (Department, Memo, Amount) jointly).")
+        if include_department and department_col not in df_all.columns:
+            lines.append(f"Note: '{department_col}' column not found; skipping Department-level analysis.")
+        if include_class and class_col in df_all.columns:
+            lines.append(f"The dataset includes a '{class_col}' column. Incorporate class-level context when attributing changes, and consider Class together with memo and Amount (analyze (Class, Memo, Amount) jointly).")
+        if include_class and class_col not in df_all.columns:
+            lines.append(f"Note: '{class_col}' column not found; skipping Class-level analysis.")
     else:
         # Fallback to MoM if unrecognized
         mode = 'mom'
@@ -520,6 +588,10 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
     dept_pair_lines = []
     dept_memo_lines = []
     dept_memo_pair_lines = []
+    class_lines = []
+    class_pair_lines = []
+    class_memo_lines = []
+    class_memo_pair_lines = []
     if mode == 'mom' and months_sorted:
         # per-month top memos
         for period in months_sorted:
@@ -542,6 +614,17 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                 except Exception:
                     pass
 
+            # per-month top classes
+            if include_class and class_col in group.columns:
+                try:
+                    agg_class = group.groupby(class_col)[value_col].sum().sort_values(ascending=False).head(10)
+                    if not agg_class.empty:
+                        class_lines.append(f"Top classes for {period.strftime('%Y-%m')}: ")
+                        for class_val, amt in agg_class.items():
+                            class_lines.append(f" - {class_val}: {amt:.2f}")
+                except Exception:
+                    pass
+
             # per-month top (Department, Memo) pairs
             if include_department and department_col in group.columns and memo_col and memo_col in group.columns:
                 try:
@@ -550,6 +633,17 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                         dept_memo_lines.append(f"Top (Department, Memo) for {period.strftime('%Y-%m')}: ")
                         for (dept_val, memo_val), amt in agg_combo.items():
                             dept_memo_lines.append(f" - ({dept_val}, {memo_val}): {amt:.2f}")
+                except Exception:
+                    pass
+
+            # per-month top (Class, Memo) pairs
+            if include_class and class_col in group.columns and memo_col and memo_col in group.columns:
+                try:
+                    agg_combo_c = group.groupby([class_col, memo_col])[value_col].sum().sort_values(ascending=False).head(10)
+                    if not agg_combo_c.empty:
+                        class_memo_lines.append(f"Top (Class, Memo) for {period.strftime('%Y-%m')}: ")
+                        for (class_val, memo_val), amt in agg_combo_c.items():
+                            class_memo_lines.append(f" - ({class_val}, {memo_val}): {amt:.2f}")
                 except Exception:
                     pass
 
@@ -653,6 +747,32 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                 except Exception:
                     pass
 
+            # Class-level pairwise diffs
+            if include_class and class_col in g_prev.columns and class_col in g_curr.columns:
+                try:
+                    agg_prev_cls = g_prev.groupby(class_col)[value_col].sum()
+                    agg_curr_cls = g_curr.groupby(class_col)[value_col].sum()
+                    combined_cls = pd.concat([agg_prev_cls.rename('prev'), agg_curr_cls.rename('curr')], axis=1).fillna(0)
+                    combined_cls['delta'] = combined_cls['curr'] - combined_cls['prev']
+                    total_delta_cls = combined_cls['delta'].sum()
+                    if total_delta_cls == 0:
+                        combined_cls['contrib_pct_of_flux'] = 0.0
+                    else:
+                        combined_cls['contrib_pct_of_flux'] = (combined_cls['delta'] / total_delta_cls) * 100
+                    top_pos_cls = combined_cls.sort_values(by='delta', ascending=False).head(5)
+                    top_neg_cls = combined_cls.sort_values(by='delta').head(5)
+                    class_pair_lines.append(' Class-level changes:')
+                    if not top_pos_cls.empty:
+                        class_pair_lines.append('  Top increases by class:')
+                        for idx, row in top_pos_cls.iterrows():
+                            class_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                    if not top_neg_cls.empty:
+                        class_pair_lines.append('  Top decreases by class:')
+                        for idx, row in top_neg_cls.iterrows():
+                            class_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                except Exception:
+                    pass
+
             # (Department, Memo) pairwise diffs
             if include_department and department_col in g_prev.columns and department_col in g_curr.columns and memo_col and memo_col in g_prev.columns and memo_col in g_curr.columns:
                 try:
@@ -676,6 +796,32 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                         dept_memo_pair_lines.append('  Top decreases by (Department, Memo):')
                         for idx, row in top_neg_c.iterrows():
                             dept_memo_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                except Exception:
+                    pass
+
+            # (Class, Memo) pairwise diffs
+            if include_class and class_col in g_prev.columns and class_col in g_curr.columns and memo_col and memo_col in g_prev.columns and memo_col in g_curr.columns:
+                try:
+                    agg_prev_cm = g_prev.groupby([class_col, memo_col])[value_col].sum()
+                    agg_curr_cm = g_curr.groupby([class_col, memo_col])[value_col].sum()
+                    combined_cm = pd.concat([agg_prev_cm.rename('prev'), agg_curr_cm.rename('curr')], axis=1).fillna(0)
+                    combined_cm['delta'] = combined_cm['curr'] - combined_cm['prev']
+                    total_delta_cm = combined_cm['delta'].sum()
+                    if total_delta_cm == 0:
+                        combined_cm['contrib_pct_of_flux'] = 0.0
+                    else:
+                        combined_cm['contrib_pct_of_flux'] = (combined_cm['delta'] / total_delta_cm) * 100
+                    top_pos_cm = combined_cm.sort_values(by='delta', ascending=False).head(5)
+                    top_neg_cm = combined_cm.sort_values(by='delta').head(5)
+                    class_memo_pair_lines.append(' (Class, Memo) changes:')
+                    if not top_pos_cm.empty:
+                        class_memo_pair_lines.append('  Top increases by (Class, Memo):')
+                        for idx, row in top_pos_cm.iterrows():
+                            class_memo_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                    if not top_neg_cm.empty:
+                        class_memo_pair_lines.append('  Top decreases by (Class, Memo):')
+                        for idx, row in top_neg_cm.iterrows():
+                            class_memo_pair_lines.append(f"   - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
                 except Exception:
                     pass
 
@@ -750,6 +896,14 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             lines.append('\n'.join(dept_memo_lines))
         if include_department and dept_memo_pair_lines:
             lines.append('\n'.join(dept_memo_pair_lines))
+        if include_class and class_lines:
+            lines.append('\n'.join(class_lines))
+        if include_class and class_pair_lines:
+            lines.append('\n'.join(class_pair_lines))
+        if include_class and class_memo_lines:
+            lines.append('\n'.join(class_memo_lines))
+        if include_class and class_memo_pair_lines:
+            lines.append('\n'.join(class_memo_pair_lines))
     if mode == 'qoq':
         if quarter_pair_lines:
             lines.append('\n'.join(quarter_pair_lines))
@@ -858,7 +1012,6 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
 
 def main():
     # Interactive prompts to collect inputs
-    default_input = '68100 details.xlsx'
     default_sheet = 0
     default_date_col = 'Period'
     default_value_col = 'Amount'
@@ -867,11 +1020,12 @@ def main():
     print('Welcome to the Great P&L Flux Analyzer! This file is to analyze the flux of the P&L only, not the balance sheet or cash flow.')
     print('If you have issues or questions, please contact Ray Sang')
     try:
-        input_path = input(f"Enter Excel filename to analyze (default '{default_input}'): ").strip()
+        input_path = input("Enter Excel filename to analyze: ").strip()
     except EOFError:
         input_path = ''
     if not input_path:
-        input_path = default_input
+        print('No Excel filename provided. Aborting.')
+        return
     if not os.path.exists(input_path):
         print(f"Warning: '{input_path}' does not exist in {os.getcwd()}. We'll attempt to open it anyway.")
 
@@ -890,6 +1044,14 @@ def main():
     include_department = dept_choice in ('y', 'yes', '1', 'true', 't')
     department_col = 'Department'
 
+    # Ask whether to refine by Class
+    try:
+        class_choice = input("Analysis by Class? (y/N): ").strip().lower()
+    except EOFError:
+        class_choice = ''
+    include_class = class_choice in ('y', 'yes', '1', 'true', 't')
+    class_col = 'Class'
+
     analysis_mode = 'mom'
     if should_analyze:
         print("Choose analysis mode: [1] Month-over-Month (MoM), [2] Quarter-over-Quarter (QoQ)")
@@ -899,7 +1061,12 @@ def main():
             mode_choice = ''
         analysis_mode = 'qoq' if mode_choice == '2' else 'mom'
 
-    summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col)
+    try:
+        summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col)
+    except Exception as e:
+        print(f"Error: {e}")
+        print('Aborting due to missing required columns. Please include Period, Amount, a Memo/Description column, and any selected optional columns (Department/Class).')
+        return
     print('Summary:')
     print(summary.to_string())
     print(f"Saved Excel to {output_excel}")
@@ -911,7 +1078,7 @@ def main():
             print('Failed to read input file for OpenAI analysis:', e)
             df_all = None
         if df_all is not None:
-            perform_openai_analysis(output_excel, df_all, summary, model=None, max_tokens=None, prompt_cap=0, analysis_mode=analysis_mode, include_department=include_department, department_col=department_col)
+            perform_openai_analysis(output_excel, df_all, summary, model=None, max_tokens=None, prompt_cap=0, analysis_mode=analysis_mode, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col)
 
 
 if __name__ == '__main__':
