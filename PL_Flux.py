@@ -17,7 +17,7 @@ import os
 import pandas as pd
 
 
-def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output_excel="summary_flux.xlsx", include_department=False, department_col="Department", include_class=False, class_col="Class"):
+def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output_excel="summary_flux.xlsx", include_department=False, department_col="Department", include_class=False, class_col="Class", fy_end_month=1):
     df = pd.read_excel(input_file, sheet_name=sheet)
 
     # Enforce required columns: Period (date_col), Amount (value_col), and Memo-like column
@@ -68,25 +68,20 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
         # ts is a Timestamp at month start
         m = int(ts.month)
         y = int(ts.year)
-        # Fiscal year ends in January; label uses the ending year
-        fy_label_end = y if m == 1 else y + 1
-        if m in (2, 3, 4):
-            start_month = 2
-            start_year = y
-            q = 1
-        elif m in (5, 6, 7):
-            start_month = 5
-            start_year = y
-            q = 2
-        elif m in (8, 9, 10):
-            start_month = 8
-            start_year = y
-            q = 3
-        else:
-            start_month = 11
-            # For January, the quarter start is November of previous year
-            start_year = y - 1 if m == 1 else y
-            q = 4
+        try:
+            fy_end = int(fy_end_month)
+        except Exception:
+            fy_end = 1
+        if fy_end < 1 or fy_end > 12:
+            fy_end = 1
+        # Fiscal year label uses the year of the fiscal year end month
+        fy_label_end = y if m <= fy_end else y + 1
+        # Q1 starts the month after the end month
+        q1_start = 1 if fy_end == 12 else fy_end + 1
+        months_since_q1 = (m - q1_start) % 12
+        q = (months_since_q1 // 3) + 1
+        start_month = ((q1_start + (q - 1) * 3 - 1) % 12) + 1
+        start_year = y if start_month <= m else y - 1
         return pd.Timestamp(year=start_year, month=start_month, day=1), f"FY{fy_label_end}-Q{q}"
 
     df[['FiscalQuarterStart', 'FiscalQuarterLabel']] = df['PeriodMonth'].apply(lambda ts: pd.Series(list(_fiscal_quarter_info_row(ts))))
@@ -100,30 +95,24 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
 
     summary = pd.concat([monthly, flux, pct], axis=1)
 
-    # Fiscal-quarter aggregation (fiscal year starts in February)
-    # Mapping: Feb-Apr => Q1, May-Jul => Q2, Aug-Oct => Q3, Nov-Jan => Q4
+    # Fiscal-quarter aggregation (dynamic fiscal year end month)
     def _fiscal_quarter_info(ts: pd.Timestamp):
         m = int(ts.month)
         y = int(ts.year)
-        # Fiscal year ends in January; label uses the ending year
-        fy_label_end = y if m == 1 else y + 1
-        if m in (2, 3, 4):
-            q = 1
-            start_month = 2
-            start_year = y
-        elif m in (5, 6, 7):
-            q = 2
-            start_month = 5
-            start_year = y
-        elif m in (8, 9, 10):
-            q = 3
-            start_month = 8
-            start_year = y
-        else:
-            q = 4
-            start_month = 11
-            start_year = y - 1 if m == 1 else y
-        # Quarter identifier and a sortable timestamp representing quarter start
+        try:
+            fy_end = int(fy_end_month)
+        except Exception:
+            fy_end = 1
+        if fy_end < 1 or fy_end > 12:
+            fy_end = 1
+        # Fiscal year label uses the year of the fiscal year end month
+        fy_label_end = y if m <= fy_end else y + 1
+        # Q1 starts the month after the end month
+        q1_start = 1 if fy_end == 12 else fy_end + 1
+        months_since_q1 = (m - q1_start) % 12
+        q = (months_since_q1 // 3) + 1
+        start_month = ((q1_start + (q - 1) * 3 - 1) % 12) + 1
+        start_year = y if start_month <= m else y - 1
         quarter_label = f"FY{fy_label_end}-Q{q}"
         quarter_start = pd.Timestamp(year=start_year, month=start_month, day=1)
         return quarter_start, quarter_label
@@ -1052,6 +1041,19 @@ def main():
     include_class = class_choice in ('y', 'yes', '1', 'true', 't')
     class_col = 'Class'
 
+    # Ask for fiscal year end month (1-12). Example: 1 for January, 6 for June, etc.
+    try:
+        fy_end_input = input("Enter fiscal year end month (1-12). For Jan enter 1 [default 12]: ").strip()
+    except EOFError:
+        fy_end_input = ''
+    try:
+        fy_end_month = int(fy_end_input) if fy_end_input else 12
+    except Exception:
+        fy_end_month = 12
+    if fy_end_month < 1 or fy_end_month > 12:
+        print("Invalid fiscal year end month. Using 12 (December).")
+        fy_end_month = 12
+
     analysis_mode = 'mom'
     if should_analyze:
         print("Choose analysis mode: [1] Month-over-Month (MoM), [2] Quarter-over-Quarter (QoQ)")
@@ -1062,7 +1064,7 @@ def main():
         analysis_mode = 'qoq' if mode_choice == '2' else 'mom'
 
     try:
-        summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col)
+        summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col, fy_end_month=fy_end_month)
     except Exception as e:
         print(f"Error: {e}")
         print('Aborting due to missing required columns. Please include Period, Amount, a Memo/Description column, and any selected optional columns (Department/Class).')
