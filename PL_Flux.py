@@ -17,8 +17,184 @@ import os
 import pandas as pd
 
 
+def _read_table_file(input_path, sheet=0):
+    """Read a table from CSV or Excel based on file extension.
+    - .csv -> pandas.read_csv
+    - .xlsx/.xls/.xlsm -> pandas.read_excel(sheet_name=sheet)
+    - otherwise: try Excel first, then CSV
+    """
+    path_lower = str(input_path).lower()
+    try:
+        if path_lower.endswith('.csv'):
+            try:
+                df = pd.read_csv(input_path)
+            except Exception:
+                # Fallback encodings
+                for enc in ('utf-8-sig', 'utf-8', 'latin1'):
+                    try:
+                        df = pd.read_csv(input_path, encoding=enc)
+                        break
+                    except Exception:
+                        continue
+                # re-raise if all fail
+                df = pd.read_csv(input_path)
+            # strip column name whitespace
+            try:
+                df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+            except Exception:
+                pass
+            return df
+        if path_lower.endswith('.xlsx') or path_lower.endswith('.xls') or path_lower.endswith('.xlsm'):
+            df = pd.read_excel(input_path, sheet_name=sheet)
+            try:
+                df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+            except Exception:
+                pass
+            return df
+        # Unknown extension: attempt Excel then CSV
+        try:
+            df = pd.read_excel(input_path, sheet_name=sheet)
+            try:
+                df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+            except Exception:
+                pass
+            return df
+        except Exception:
+            try:
+                df = pd.read_csv(input_path)
+            except Exception:
+                for enc in ('utf-8-sig', 'utf-8', 'latin1'):
+                    try:
+                        df = pd.read_csv(input_path, encoding=enc)
+                        break
+                    except Exception:
+                        continue
+                df = pd.read_csv(input_path)
+            try:
+                df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+            except Exception:
+                pass
+            return df
+    except Exception as e:
+        raise e
+
+
+def _coerce_amount_inplace(df, value_col):
+    """Ensure df[value_col] is numeric, handling $, commas, and parentheses.
+    Modifies df in place.
+    """
+    try:
+        if value_col in df.columns:
+            if not pd.api.types.is_numeric_dtype(df[value_col]):
+                s = df[value_col].astype(str).str.strip()
+                # Convert parentheses negatives and remove currency/commas
+                s = s.str.replace('(', '-', regex=False).str.replace(')', '', regex=False)
+                s = s.str.replace(',', '', regex=False).str.replace('$', '', regex=False)
+                df[value_col] = pd.to_numeric(s, errors='coerce')
+    except Exception:
+        pass
+
+
+def ensure_openai_env():
+    """Ensure `.env` exists and contains OPENAI_API_KEY (and OPENAI_BASE_URL).
+    If missing, prompt the user, write/update `.env`, and set os.environ.
+    """
+    env_path = os.path.join(os.getcwd(), '.env')
+    existing = {}
+    # Load existing .env key/values if present
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith('#') or '=' not in ln:
+                        continue
+                    k, v = ln.split('=', 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k:
+                        existing[k] = v
+        except Exception:
+            try:
+                with open(env_path, 'r') as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln or ln.startswith('#') or '=' not in ln:
+                            continue
+                        k, v = ln.split('=', 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k:
+                            existing[k] = v
+            except Exception:
+                pass
+
+    has_api_key = bool(os.environ.get('OPENAI_API_KEY') or existing.get('OPENAI_API_KEY'))
+
+    # If we already have a key (either env or .env), ensure env is populated and return
+    if has_api_key and os.path.exists(env_path):
+        if 'OPENAI_API_KEY' not in os.environ and existing.get('OPENAI_API_KEY'):
+            os.environ['OPENAI_API_KEY'] = existing['OPENAI_API_KEY']
+        if existing.get('OPENAI_BASE_URL') and 'OPENAI_BASE_URL' not in os.environ:
+            os.environ['OPENAI_BASE_URL'] = existing['OPENAI_BASE_URL']
+        return
+
+    print('OpenAI API key not configured. Let\'s set it up now.')
+    # Prompt user for API key (shown as you type)
+    try:
+        api_key = input('Enter your OpenAI API key (will be shown): ').strip()
+    except EOFError:
+        api_key = ''
+    # Display back what was entered so user can verify
+    if api_key:
+        print(f'You entered OPENAI_API_KEY: {api_key}')
+
+    default_base = 'https://api.openai.com/v1'
+    try:
+        base_url_input = input(f'Enter OpenAI base URL. Hit enter to use default [{default_base}]: ').strip()
+    except EOFError:
+        base_url_input = ''
+    base_url = base_url_input or default_base
+
+    # Update map and environment
+    if api_key:
+        existing['OPENAI_API_KEY'] = api_key
+        os.environ['OPENAI_API_KEY'] = api_key
+    if base_url:
+        existing['OPENAI_BASE_URL'] = base_url
+        os.environ['OPENAI_BASE_URL'] = base_url
+
+    # Write or update .env
+    try:
+        with open(env_path, 'w', encoding='utf-8') as f:
+            for k, v in existing.items():
+                if not k:
+                    continue
+                f.write(f'{k}={v}\n')
+        print(f'Saved OpenAI settings to {env_path}')
+    except Exception:
+        try:
+            with open(env_path, 'w') as f:
+                for k, v in existing.items():
+                    if not k:
+                        continue
+                    f.write(f'{k}={v}\n')
+            print(f'Saved OpenAI settings to {env_path}')
+        except Exception as e:
+            print('Failed to write .env:', e)
+
+
 def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output_excel="summary_flux.xlsx", include_department=False, department_col="Department", include_class=False, class_col="Class", fy_end_month=1):
-    df = pd.read_excel(input_file, sheet_name=sheet)
+    df = _read_table_file(input_file, sheet=sheet)
+    # Normalize common column names (case/whitespace)
+    lowered = {str(c).strip().lower(): c for c in df.columns}
+    # Remap requested date/value columns if their case/spacing differs
+    if date_col.lower() in lowered and lowered[date_col.lower()] != date_col:
+        date_col = lowered[date_col.lower()]
+    if value_col.lower() in lowered and lowered[value_col.lower()] != value_col:
+        value_col = lowered[value_col.lower()]
+    # Coerce Amount-like column to numeric for CSV inputs
+    _coerce_amount_inplace(df, value_col)
 
     # Enforce required columns: Period (date_col), Amount (value_col), and Memo-like column
     missing = []
@@ -1009,7 +1185,7 @@ def main():
     print('Welcome to the Great P&L Flux Analyzer! This file is to analyze the flux of the P&L only, not the balance sheet or cash flow.')
     print('If you have issues or questions, please contact Ray Sang')
     try:
-        input_path = input("Enter Excel filename to analyze: ").strip()
+        input_path = input("Enter Excel/CSV filename to analyze: ").strip()
     except EOFError:
         input_path = ''
     if not input_path:
@@ -1074,8 +1250,17 @@ def main():
     print(f"Saved Excel to {output_excel}")
 
     if should_analyze:
+        # Ensure OpenAI environment is configured before analysis
+        ensure_openai_env()
         try:
-            df_all = pd.read_excel(input_path, sheet_name=default_sheet)
+            df_all = _read_table_file(input_path, sheet=default_sheet)
+            # Normalize columns for AI path as well
+            lowered_all = {str(c).strip().lower(): c for c in df_all.columns}
+            if default_date_col.lower() in lowered_all and lowered_all[default_date_col.lower()] != default_date_col:
+                default_date_col = lowered_all[default_date_col.lower()]
+            if default_value_col.lower() in lowered_all and lowered_all[default_value_col.lower()] != default_value_col:
+                default_value_col = lowered_all[default_value_col.lower()]
+            _coerce_amount_inplace(df_all, default_value_col)
         except Exception as e:
             print('Failed to read input file for OpenAI analysis:', e)
             df_all = None
