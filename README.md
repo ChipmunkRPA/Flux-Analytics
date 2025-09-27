@@ -110,6 +110,10 @@ The tool automatically manages OpenAI API configuration:
 4. Review the generated Excel workbook and AI analysis
 5. Use insights for financial planning and analysis
 
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
 ## Contact
 
 For issues or questions, contact Ray Sang.
