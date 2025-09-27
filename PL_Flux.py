@@ -237,23 +237,31 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
         except Exception:
             # Try parsing month-year format like 'Feb-25'
             try:
-                # Convert 'Feb-25' format to proper date
+                # Convert various date formats to proper date
                 def parse_month_year(val):
                     if pd.isna(val):
                         return pd.NaT
                     val_str = str(val).strip()
                     if '-' in val_str and len(val_str.split('-')) == 2:
-                        month_part, year_part = val_str.split('-')
+                        part1, part2 = val_str.split('-')
                         # Convert month name to number
                         month_map = {
                             'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
                             'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
                         }
-                        month_num = month_map.get(month_part.lower())
+                        
+                        # Try both formats: "Feb-25" and "25-Feb" (both are month-year)
+                        month_num = month_map.get(part1.lower())
                         if month_num:
-                            # Assume 20xx for 2-digit years
-                            year = int('20' + year_part) if len(year_part) == 2 else int(year_part)
+                            # Format: "Feb-25" (month-year)
+                            year = int('20' + part2) if len(part2) == 2 else int(part2)
                             return pd.Timestamp(year=year, month=month_num, day=1)
+                        else:
+                            month_num = month_map.get(part2.lower())
+                            if month_num:
+                                # Format: "25-Feb" (year-month) - 25 means 2025
+                                year = int('20' + part1) if len(part1) == 2 else int(part1)
+                                return pd.Timestamp(year=year, month=month_num, day=1)
                     return pd.NaT
                 
                 df[date_col] = original_period_values.apply(parse_month_year)
@@ -1201,97 +1209,118 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
     return analysis
 
 
+def _pause_before_exit():
+    """Pause before exiting to allow user to see error messages in PyInstaller executable."""
+    try:
+        input("\nPress Enter to exit...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def main():
-    # Interactive prompts to collect inputs
-    default_sheet = 0
-    default_date_col = 'Period'
-    default_value_col = 'Amount'
-    output_excel = 'summary_flux.xlsx'
-
-    print('Welcome to the Great P&L Flux Analyzer! This file is to analyze the flux of the P&L only, not the balance sheet or cash flow.')
-    print('If you have issues or questions, please contact Ray Sang')
     try:
-        input_path = input("Enter Excel/CSV filename to analyze: ").strip()
-    except EOFError:
-        input_path = ''
-    if not input_path:
-        print('No Excel filename provided. Aborting.')
-        return
-    if not os.path.exists(input_path):
-        print(f"Warning: '{input_path}' does not exist in {os.getcwd()}. We'll attempt to open it anyway.")
+        # Interactive prompts to collect inputs
+        default_sheet = 0
+        default_date_col = 'Period'
+        default_value_col = 'Amount'
+        output_excel = 'summary_flux.xlsx'
 
-    # Ask whether to run AI analysis
-    try:
-        ai_choice = input('Run AI analysis? (y/N): ').strip().lower()
-    except EOFError:
-        ai_choice = ''
-    should_analyze = ai_choice in ('y', 'yes', '1', 'true', 't')
-
-    # Ask whether to refine by Department
-    try:
-        dept_choice = input("Analysis by Department? (y/N): ").strip().lower()
-    except EOFError:
-        dept_choice = ''
-    include_department = dept_choice in ('y', 'yes', '1', 'true', 't')
-    department_col = 'Department'
-
-    # Ask whether to refine by Class
-    try:
-        class_choice = input("Analysis by Class? (y/N): ").strip().lower()
-    except EOFError:
-        class_choice = ''
-    include_class = class_choice in ('y', 'yes', '1', 'true', 't')
-    class_col = 'Class'
-
-    # Ask for fiscal year end month (1-12). Example: 1 for January, 6 for June, etc.
-    try:
-        fy_end_input = input("Enter fiscal year end month (1-12). For Jan enter 1 [default 12]: ").strip()
-    except EOFError:
-        fy_end_input = ''
-    try:
-        fy_end_month = int(fy_end_input) if fy_end_input else 12
-    except Exception:
-        fy_end_month = 12
-    if fy_end_month < 1 or fy_end_month > 12:
-        print("Invalid fiscal year end month. Using 12 (December).")
-        fy_end_month = 12
-
-    analysis_mode = 'mom'
-    if should_analyze:
-        print("Choose analysis mode: [1] Month-over-Month (MoM), [2] Quarter-over-Quarter (QoQ)")
+        print('Welcome to the Great P&L Flux Analyzer! This file is to analyze the flux of the P&L only, not the balance sheet or cash flow.')
+        print('If you have issues or questions, please contact Ray Sang')
+        
         try:
-            mode_choice = input('Enter 1 for MoM or 2 for QoQ (default 1): ').strip()
+            input_path = input("Enter Excel/CSV filename to analyze: ").strip()
         except EOFError:
-            mode_choice = ''
-        analysis_mode = 'qoq' if mode_choice == '2' else 'mom'
+            input_path = ''
+        if not input_path:
+            print('No Excel filename provided. Aborting.')
+            _pause_before_exit()
+            return
+        if not os.path.exists(input_path):
+            print(f"Warning: '{input_path}' does not exist in {os.getcwd()}. We'll attempt to open it anyway.")
 
-    try:
-        summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col, fy_end_month=fy_end_month)
-    except Exception as e:
-        print(f"Error: {e}")
-        print('Aborting due to missing required columns. Please include Period, Amount, a Memo/Description column, and any selected optional columns (Department/Class).')
-        return
-    print('Summary:')
-    print(summary.to_string())
-    print(f"Saved Excel to {output_excel}")
-
-    if should_analyze:
-        # Ensure OpenAI environment is configured before analysis
-        ensure_openai_env()
+        # Ask whether to run AI analysis
         try:
-            df_all = _read_table_file(input_path, sheet=default_sheet)
-            # Normalize columns for AI path as well
-            lowered_all = {str(c).strip().lower(): c for c in df_all.columns}
-            if default_date_col.lower() in lowered_all and lowered_all[default_date_col.lower()] != default_date_col:
-                default_date_col = lowered_all[default_date_col.lower()]
-            if default_value_col.lower() in lowered_all and lowered_all[default_value_col.lower()] != default_value_col:
-                default_value_col = lowered_all[default_value_col.lower()]
-            _coerce_amount_inplace(df_all, default_value_col)
+            ai_choice = input('Run AI analysis? (y/N): ').strip().lower()
+        except EOFError:
+            ai_choice = ''
+        should_analyze = ai_choice in ('y', 'yes', '1', 'true', 't')
+
+        # Ask whether to refine by Department
+        try:
+            dept_choice = input("Analysis by Department? (y/N): ").strip().lower()
+        except EOFError:
+            dept_choice = ''
+        include_department = dept_choice in ('y', 'yes', '1', 'true', 't')
+        department_col = 'Department'
+
+        # Ask whether to refine by Class
+        try:
+            class_choice = input("Analysis by Class? (y/N): ").strip().lower()
+        except EOFError:
+            class_choice = ''
+        include_class = class_choice in ('y', 'yes', '1', 'true', 't')
+        class_col = 'Class'
+
+        # Ask for fiscal year end month (1-12). Example: 1 for January, 6 for June, etc.
+        try:
+            fy_end_input = input("Enter fiscal year end month (1-12). For Jan enter 1 [default 12]: ").strip()
+        except EOFError:
+            fy_end_input = ''
+        try:
+            fy_end_month = int(fy_end_input) if fy_end_input else 12
+        except Exception:
+            fy_end_month = 12
+        if fy_end_month < 1 or fy_end_month > 12:
+            print("Invalid fiscal year end month. Using 12 (December).")
+            fy_end_month = 12
+
+        analysis_mode = 'mom'
+        if should_analyze:
+            print("Choose analysis mode: [1] Month-over-Month (MoM), [2] Quarter-over-Quarter (QoQ)")
+            try:
+                mode_choice = input('Enter 1 for MoM or 2 for QoQ (default 1): ').strip()
+            except EOFError:
+                mode_choice = ''
+            analysis_mode = 'qoq' if mode_choice == '2' else 'mom'
+
+        try:
+            summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col, fy_end_month=fy_end_month)
         except Exception as e:
-            print('Failed to read input file for OpenAI analysis:', e)
-            df_all = None
-        if df_all is not None:
-            perform_openai_analysis(output_excel, df_all, summary, model=None, max_tokens=None, prompt_cap=0, analysis_mode=analysis_mode, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col)
+            print(f"Error: {e}")
+            print('Aborting due to missing required columns. Please include Period, Amount, a Memo/Description column, and any selected optional columns (Department/Class).')
+            _pause_before_exit()
+            return
+        print('Summary:')
+        print(summary.to_string())
+        print(f"Saved Excel to {output_excel}")
+
+        if should_analyze:
+            # Ensure OpenAI environment is configured before analysis
+            ensure_openai_env()
+            try:
+                df_all = _read_table_file(input_path, sheet=default_sheet)
+                # Normalize columns for AI path as well
+                lowered_all = {str(c).strip().lower(): c for c in df_all.columns}
+                if default_date_col.lower() in lowered_all and lowered_all[default_date_col.lower()] != default_date_col:
+                    default_date_col = lowered_all[default_date_col.lower()]
+                if default_value_col.lower() in lowered_all and lowered_all[default_value_col.lower()] != default_value_col:
+                    default_value_col = lowered_all[default_value_col.lower()]
+                _coerce_amount_inplace(df_all, default_value_col)
+            except Exception as e:
+                print('Failed to read input file for OpenAI analysis:', e)
+                df_all = None
+            if df_all is not None:
+                perform_openai_analysis(output_excel, df_all, summary, model=None, max_tokens=None, prompt_cap=0, analysis_mode=analysis_mode, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col)
+        
+        _pause_before_exit()
+        
+    except Exception as e:
+        print(f"\nUnexpected error occurred: {e}")
+        import traceback
+        print("\nFull error details:")
+        traceback.print_exc()
+        _pause_before_exit()
 
 
 if __name__ == '__main__':
