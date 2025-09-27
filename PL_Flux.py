@@ -228,13 +228,39 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
     # At this point required columns were validated above
 
     # Parse dates (coerce invalids)
+    original_period_values = df[date_col].copy()  # Keep original values for custom parsing
     df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
     if df[date_col].isna().all():
         # Try parsing as Period (like '2025-01' or '202501')
         try:
-            df[date_col] = pd.PeriodIndex(df[date_col].astype(str), freq='M').to_timestamp()
+            df[date_col] = pd.PeriodIndex(original_period_values.astype(str), freq='M').to_timestamp()
         except Exception:
-            raise ValueError(f"Could not parse '{date_col}' as dates or periods.")
+            # Try parsing month-year format like 'Feb-25'
+            try:
+                # Convert 'Feb-25' format to proper date
+                def parse_month_year(val):
+                    if pd.isna(val):
+                        return pd.NaT
+                    val_str = str(val).strip()
+                    if '-' in val_str and len(val_str.split('-')) == 2:
+                        month_part, year_part = val_str.split('-')
+                        # Convert month name to number
+                        month_map = {
+                            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+                        }
+                        month_num = month_map.get(month_part.lower())
+                        if month_num:
+                            # Assume 20xx for 2-digit years
+                            year = int('20' + year_part) if len(year_part) == 2 else int(year_part)
+                            return pd.Timestamp(year=year, month=month_num, day=1)
+                    return pd.NaT
+                
+                df[date_col] = original_period_values.apply(parse_month_year)
+                if df[date_col].isna().all():
+                    raise ValueError(f"Could not parse '{date_col}' as dates or periods.")
+            except Exception:
+                raise ValueError(f"Could not parse '{date_col}' as dates or periods.")
 
     # Create monthly period (timestamp at month start)
     df['PeriodMonth'] = df[date_col].dt.to_period('M').dt.to_timestamp()
