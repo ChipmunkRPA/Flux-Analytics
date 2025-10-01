@@ -296,6 +296,26 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
 
     df[['FiscalQuarterStart', 'FiscalQuarterLabel']] = df['PeriodMonth'].apply(lambda ts: pd.Series(list(_fiscal_quarter_info_row(ts))))
 
+    # Attach fiscal year start and label to each row for YoY analysis
+    def _fiscal_year_info_row(ts):
+        # ts is a Timestamp at month start
+        m = int(ts.month)
+        y = int(ts.year)
+        try:
+            fy_end = int(fy_end_month)
+        except Exception:
+            fy_end = 1
+        if fy_end < 1 or fy_end > 12:
+            fy_end = 1
+        # Fiscal year label uses the year of the fiscal year end month
+        fy_label_end = y if m <= fy_end else y + 1
+        # Fiscal year starts the month after the end month
+        fy_start_month = 1 if fy_end == 12 else fy_end + 1
+        fy_start_year = y if m >= fy_start_month else y - 1
+        return pd.Timestamp(year=fy_start_year, month=fy_start_month, day=1), f"FY{fy_label_end}"
+
+    df[['FiscalYearStart', 'FiscalYearLabel']] = df['PeriodMonth'].apply(lambda ts: pd.Series(list(_fiscal_year_info_row(ts))))
+
     # Amount existence validated above
 
     # Aggregate
@@ -351,6 +371,49 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
     else:
         quarter_summary = None
 
+    # Fiscal-year aggregation (dynamic fiscal year end month) for YoY analysis
+    def _fiscal_year_info(ts: pd.Timestamp):
+        m = int(ts.month)
+        y = int(ts.year)
+        try:
+            fy_end = int(fy_end_month)
+        except Exception:
+            fy_end = 1
+        if fy_end < 1 or fy_end > 12:
+            fy_end = 1
+        # Fiscal year label uses the year of the fiscal year end month
+        fy_label_end = y if m <= fy_end else y + 1
+        # Fiscal year starts the month after the end month
+        fy_start_month = 1 if fy_end == 12 else fy_end + 1
+        fy_start_year = y if m >= fy_start_month else y - 1
+        year_label = f"FY{fy_label_end}"
+        year_start = pd.Timestamp(year=fy_start_year, month=fy_start_month, day=1)
+        return year_start, year_label
+
+    # Build yearly series by mapping each month to its fiscal year
+    y_map = {}
+    for ts, amt in monthly.items():
+        ys, ylabel = _fiscal_year_info(ts)
+        if ys in y_map:
+            y_map[ys]['Amount'] += float(amt)
+        else:
+            y_map[ys] = {'Amount': float(amt), 'YearLabel': ylabel}
+
+    if y_map:
+        y_items = sorted(y_map.items(), key=lambda x: x[0])
+        year_index = [k for k, v in y_items]
+        year_amounts = pd.Series([v['Amount'] for k, v in y_items], index=year_index).rename('Amount')
+        y_flux = year_amounts.diff().fillna(0).rename('YoY_Flux')
+        y_pct = year_amounts.pct_change().fillna(0).rename('YoY_Pct') * 100
+        year_summary = pd.concat([year_amounts, y_flux, y_pct], axis=1)
+        # add readable label column
+        year_summary = year_summary.reset_index().rename(columns={'index': 'YearStart'})
+        year_summary['Year'] = year_summary['YearStart'].apply(lambda ts: y_map.get(ts, {}).get('YearLabel', str(ts)))
+        # order columns
+        year_summary = year_summary[['Year', 'YearStart', 'Amount', 'YoY_Flux', 'YoY_Pct']]
+    else:
+        year_summary = None
+
     # Save to Excel: include a Summary sheet and one sheet per month with transactions
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
         # Summary sheet (trend) - write Period as YYYY-MM strings so Excel x-axis shows months
@@ -371,6 +434,16 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
                 q_out = quarter_summary.copy()
                 q_out['QuarterStart'] = q_out['QuarterStart'].dt.strftime('%Y-%m')
                 q_out.to_excel(writer, sheet_name='Quarterly', index=False)
+            except Exception:
+                pass
+
+        # write yearly sheet if available
+        if year_summary is not None:
+            try:
+                # format YearStart as YYYY-MM for readability
+                y_out = year_summary.copy()
+                y_out['YearStart'] = y_out['YearStart'].dt.strftime('%Y-%m')
+                y_out.to_excel(writer, sheet_name='Yearly', index=False)
             except Exception:
                 pass
 
@@ -482,6 +555,59 @@ def summarize(input_file, sheet=0, date_col="Period", value_col="Amount", output
         except Exception:
             pass
 
+        # Per-year transaction sheets: group by FiscalYearStart and write each year's transactions
+        try:
+            for ystart, ygroup in df.groupby('FiscalYearStart'):
+                ylabel = None
+                if 'FiscalYearLabel' in ygroup.columns:
+                    ylabel = ygroup['FiscalYearLabel'].iloc[0]
+                sheet_name = (str(ylabel) if ylabel is not None else ystart.strftime('%Y-%m'))
+                sheet_name = sheet_name[:31]
+                try:
+                    y_to_write = ygroup.drop(columns=['PeriodMonth'], errors='ignore')
+                    y_to_write = y_to_write.drop(columns=['FiscalQuarterStart', 'FiscalQuarterLabel'], errors='ignore')
+                    y_to_write = y_to_write.drop(columns=['FiscalYearStart', 'FiscalYearLabel'], errors='ignore')
+                    y_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
+                except Exception:
+                    safe_name = sheet_name[:25] + '_' + str(abs(hash(sheet_name)) % 1000)
+                    y_to_write.to_excel(writer, sheet_name=safe_name, index=False)
+
+                # Optionally, also create per-department sheets within each year
+                if include_department and department_col in ygroup.columns:
+                    try:
+                        for dept_value, dept_group in ygroup.groupby(department_col):
+                            base = (str(ylabel) if ylabel is not None else ystart.strftime('%Y-%m'))
+                            dept_label = str(dept_value) if pd.notna(dept_value) else 'Unknown'
+                            candidate = f"{base}-{dept_label}"
+                            sheet_name_dept = candidate[:31]
+                            dept_out = dept_group.drop(columns=['PeriodMonth', 'FiscalQuarterStart', 'FiscalQuarterLabel', 'FiscalYearStart', 'FiscalYearLabel'], errors='ignore').reset_index(drop=True)
+                            try:
+                                dept_out.to_excel(writer, sheet_name=sheet_name_dept, index=False)
+                            except Exception:
+                                safe_name = (base + '-' + str(abs(hash(dept_label)) % 10000))[:31]
+                                dept_out.to_excel(writer, sheet_name=safe_name, index=False)
+                    except Exception:
+                        pass
+
+                # Optionally, also create per-class sheets within each year
+                if include_class and class_col in ygroup.columns:
+                    try:
+                        for class_value, class_group in ygroup.groupby(class_col):
+                            base = (str(ylabel) if ylabel is not None else ystart.strftime('%Y-%m'))
+                            class_label = str(class_value) if pd.notna(class_value) else 'Unknown'
+                            candidate = f"{base}-{class_label}"
+                            sheet_name_class = candidate[:31]
+                            class_out = class_group.drop(columns=['PeriodMonth', 'FiscalQuarterStart', 'FiscalQuarterLabel', 'FiscalYearStart', 'FiscalYearLabel'], errors='ignore').reset_index(drop=True)
+                            try:
+                                class_out.to_excel(writer, sheet_name=sheet_name_class, index=False)
+                            except Exception:
+                                safe_name = (base + '-' + str(abs(hash(class_label)) % 10000))[:31]
+                                class_out.to_excel(writer, sheet_name=safe_name, index=False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     # Chart generation and embedding removed by user request.
 
     return summary
@@ -568,6 +694,16 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             pass
     elif mode == 'qoq':
         lines.append("You are given fiscal-quarter totals and (when available) quarter-level detail. Explain the main quarter-over-quarter fluctuations and likely causes.")
+        if include_department and department_col in df_all.columns:
+            lines.append(f"The dataset includes a '{department_col}' column. Incorporate department-level context when attributing changes, and consider Department together with memo and Amount (analyze (Department, Memo, Amount) jointly).")
+        if include_department and department_col not in df_all.columns:
+            lines.append(f"Note: '{department_col}' column not found; skipping Department-level analysis.")
+        if include_class and class_col in df_all.columns:
+            lines.append(f"The dataset includes a '{class_col}' column. Incorporate class-level context when attributing changes, and consider Class together with memo and Amount (analyze (Class, Memo, Amount) jointly).")
+        if include_class and class_col not in df_all.columns:
+            lines.append(f"Note: '{class_col}' column not found; skipping Class-level analysis.")
+    elif mode == 'yoy':
+        lines.append("You are given fiscal-year totals and (when available) year-level detail. Explain the main year-over-year fluctuations and likely causes.")
         if include_department and department_col in df_all.columns:
             lines.append(f"The dataset includes a '{department_col}' column. Incorporate department-level context when attributing changes, and consider Department together with memo and Amount (analyze (Department, Memo, Amount) jointly).")
         if include_department and department_col not in df_all.columns:
@@ -779,6 +915,61 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
         except Exception:
             pass
 
+    # If a yearly sheet was produced, attempt to read it and add YoY explicit mapping (YoY only)
+    if mode == 'yoy':
+        try:
+            # try reading Yearly from the output Excel if present
+            y_summary = None
+            try:
+                ydf = pd.read_excel(output_excel, sheet_name='Yearly')
+                if not ydf.empty:
+                    y_summary = ydf
+            except Exception:
+                # fallback: build from summary_df if possible
+                if 'Year' in summary_df.columns and 'YoY_Flux' in summary_df.columns:
+                    y_summary = summary_df[['Year', 'YoY_Flux', 'YoY_Pct']]
+            if y_summary is not None:
+                lines.append('\nYearly summary (fiscal years):')
+                # show the year table
+                try:
+                    lines.append(y_summary.to_string(index=False))
+                except Exception:
+                    lines.append(str(y_summary))
+                # explicit adjacent YoY mapping
+                try:
+                    y_lines = []
+                    # expect a column named 'Year' or 'YearStart' to determine order
+                    if 'YearStart' in y_summary.columns:
+                        y_summary['YearStart_ts'] = pd.to_datetime(y_summary['YearStart'])
+                        y_sorted = y_summary.sort_values(by='YearStart_ts')
+                    elif 'Year' in y_summary.columns:
+                        y_sorted = y_summary
+                    else:
+                        y_sorted = y_summary
+                    for i in range(1, len(y_sorted)):
+                        prev = y_sorted.iloc[i-1]
+                        curr = y_sorted.iloc[i]
+                        prev_label = prev.get('Year') or str(prev.get('YearStart'))
+                        curr_label = curr.get('Year') or str(curr.get('YearStart'))
+                        flux = curr.get('YoY_Flux')
+                        pct = curr.get('YoY_Pct')
+                        try:
+                            flux_f = f"{float(flux):,.2f}"
+                        except Exception:
+                            flux_f = str(flux)
+                        try:
+                            pct_f = f"{float(pct):.1f}%"
+                        except Exception:
+                            pct_f = str(pct)
+                        y_lines.append(f"{prev_label} -> {curr_label}: YoY_Flux: {flux_f}, YoY_Pct: {pct_f}")
+                    if y_lines:
+                        lines.append('\nExplicit adjacent-pair YoY values:')
+                        lines.append('\n'.join(y_lines))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     memo_lines = []
     pair_lines = []
     quarter_memo_lines = []
@@ -796,7 +987,7 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
         for period in months_sorted:
             group = month_groups[period]
             if memo_col and memo_col in group.columns:
-                agg = group.groupby(memo_col)[value_col].sum().sort_values(ascending=False).head(10)
+                agg = group.groupby(memo_col)[value_col].sum().sort_values(ascending=False).head(30)
                 if not agg.empty:
                     memo_lines.append(f"Top memos for {period.strftime('%Y-%m')}: ")
                     for memo_val, amt in agg.items():
@@ -805,7 +996,7 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             # per-month top departments
             if include_department and department_col in group.columns:
                 try:
-                    agg_dept = group.groupby(department_col)[value_col].sum().sort_values(ascending=False).head(10)
+                    agg_dept = group.groupby(department_col)[value_col].sum().sort_values(ascending=False).head(30)
                     if not agg_dept.empty:
                         dept_lines.append(f"Top departments for {period.strftime('%Y-%m')}: ")
                         for dept_val, amt in agg_dept.items():
@@ -816,7 +1007,7 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             # per-month top classes
             if include_class and class_col in group.columns:
                 try:
-                    agg_class = group.groupby(class_col)[value_col].sum().sort_values(ascending=False).head(10)
+                    agg_class = group.groupby(class_col)[value_col].sum().sort_values(ascending=False).head(30)
                     if not agg_class.empty:
                         class_lines.append(f"Top classes for {period.strftime('%Y-%m')}: ")
                         for class_val, amt in agg_class.items():
@@ -827,7 +1018,7 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             # per-month top (Department, Memo) pairs
             if include_department and department_col in group.columns and memo_col and memo_col in group.columns:
                 try:
-                    agg_combo = group.groupby([department_col, memo_col])[value_col].sum().sort_values(ascending=False).head(10)
+                    agg_combo = group.groupby([department_col, memo_col])[value_col].sum().sort_values(ascending=False).head(30)
                     if not agg_combo.empty:
                         dept_memo_lines.append(f"Top (Department, Memo) for {period.strftime('%Y-%m')}: ")
                         for (dept_val, memo_val), amt in agg_combo.items():
@@ -838,7 +1029,7 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             # per-month top (Class, Memo) pairs
             if include_class and class_col in group.columns and memo_col and memo_col in group.columns:
                 try:
-                    agg_combo_c = group.groupby([class_col, memo_col])[value_col].sum().sort_values(ascending=False).head(10)
+                    agg_combo_c = group.groupby([class_col, memo_col])[value_col].sum().sort_values(ascending=False).head(30)
                     if not agg_combo_c.empty:
                         class_memo_lines.append(f"Top (Class, Memo) for {period.strftime('%Y-%m')}: ")
                         for (class_val, memo_val), amt in agg_combo_c.items():
@@ -869,8 +1060,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                     combined['contrib_pct_of_flux'] = 0.0
                 else:
                     combined['contrib_pct_of_flux'] = (combined['delta'] / total_delta) * 100
-                top_pos = combined.sort_values(by='delta', ascending=False).head(5)
-                top_neg = combined.sort_values(by='delta').head(5)
+                top_pos = combined.sort_values(by='delta', ascending=False).head(15)
+                top_neg = combined.sort_values(by='delta').head(15)
                 def fmt_pct(v):
                     try:
                         if pd.isna(v):
@@ -895,18 +1086,18 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                 new_memos = set(agg_curr.index) - set(agg_prev.index)
                 gone_memos = set(agg_prev.index) - set(agg_curr.index)
                 if new_memos:
-                    pair_lines.append(f"  New memos in {m_curr.strftime('%Y-%m')}: {', '.join(list(new_memos)[:5])}")
+                    pair_lines.append(f"  New memos in {m_curr.strftime('%Y-%m')}: {', '.join(list(new_memos)[:15])}")
                 if gone_memos:
-                    pair_lines.append(f"  Disappeared memos since {m_prev.strftime('%Y-%m')}: {', '.join(list(gone_memos)[:5])}")
+                    pair_lines.append(f"  Disappeared memos since {m_prev.strftime('%Y-%m')}: {', '.join(list(gone_memos)[:15])}")
                 examples = []
-                top_memos_examples = list(top_pos.index[:3]) + list(top_neg.index[:3])
+                top_memos_examples = list(top_pos.index[:9]) + list(top_neg.index[:9])
                 seen = set()
                 for memo_val in top_memos_examples:
                     if memo_val in seen:
                         continue
                     seen.add(memo_val)
-                    ex_prev = g_prev[g_prev[memo_col] == memo_val][[memo_col, value_col]].head(3)
-                    ex_curr = g_curr[g_curr[memo_col] == memo_val][[memo_col, value_col]].head(3)
+                    ex_prev = g_prev[g_prev[memo_col] == memo_val][[memo_col, value_col]].head(9)
+                    ex_curr = g_curr[g_curr[memo_col] == memo_val][[memo_col, value_col]].head(9)
                     if not ex_prev.empty:
                         examples.append(f" Examples for '{memo_val}' in {m_prev.strftime('%Y-%m')}: ")
                         for _, r in ex_prev.iterrows():
@@ -932,8 +1123,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                         combined_d['contrib_pct_of_flux'] = 0.0
                     else:
                         combined_d['contrib_pct_of_flux'] = (combined_d['delta'] / total_delta_d) * 100
-                    top_pos_d = combined_d.sort_values(by='delta', ascending=False).head(5)
-                    top_neg_d = combined_d.sort_values(by='delta').head(5)
+                    top_pos_d = combined_d.sort_values(by='delta', ascending=False).head(15)
+                    top_neg_d = combined_d.sort_values(by='delta').head(15)
                     dept_pair_lines.append(' Department-level changes:')
                     if not top_pos_d.empty:
                         dept_pair_lines.append('  Top increases by department:')
@@ -958,8 +1149,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                         combined_cls['contrib_pct_of_flux'] = 0.0
                     else:
                         combined_cls['contrib_pct_of_flux'] = (combined_cls['delta'] / total_delta_cls) * 100
-                    top_pos_cls = combined_cls.sort_values(by='delta', ascending=False).head(5)
-                    top_neg_cls = combined_cls.sort_values(by='delta').head(5)
+                    top_pos_cls = combined_cls.sort_values(by='delta', ascending=False).head(15)
+                    top_neg_cls = combined_cls.sort_values(by='delta').head(15)
                     class_pair_lines.append(' Class-level changes:')
                     if not top_pos_cls.empty:
                         class_pair_lines.append('  Top increases by class:')
@@ -984,8 +1175,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                         combined_c['contrib_pct_of_flux'] = 0.0
                     else:
                         combined_c['contrib_pct_of_flux'] = (combined_c['delta'] / total_delta_c) * 100
-                    top_pos_c = combined_c.sort_values(by='delta', ascending=False).head(5)
-                    top_neg_c = combined_c.sort_values(by='delta').head(5)
+                    top_pos_c = combined_c.sort_values(by='delta', ascending=False).head(15)
+                    top_neg_c = combined_c.sort_values(by='delta').head(15)
                     dept_memo_pair_lines.append(' (Department, Memo) changes:')
                     if not top_pos_c.empty:
                         dept_memo_pair_lines.append('  Top increases by (Department, Memo):')
@@ -1010,8 +1201,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                         combined_cm['contrib_pct_of_flux'] = 0.0
                     else:
                         combined_cm['contrib_pct_of_flux'] = (combined_cm['delta'] / total_delta_cm) * 100
-                    top_pos_cm = combined_cm.sort_values(by='delta', ascending=False).head(5)
-                    top_neg_cm = combined_cm.sort_values(by='delta').head(5)
+                    top_pos_cm = combined_cm.sort_values(by='delta', ascending=False).head(15)
+                    top_neg_cm = combined_cm.sort_values(by='delta').head(15)
                     class_memo_pair_lines.append(' (Class, Memo) changes:')
                     if not top_pos_cm.empty:
                         class_memo_pair_lines.append('  Top increases by (Class, Memo):')
@@ -1067,8 +1258,8 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                             combined['contrib_pct_of_flux'] = 0.0
                         else:
                             combined['contrib_pct_of_flux'] = (combined['delta'] / total_delta) * 100
-                        top_pos = combined.sort_values(by='delta', ascending=False).head(5)
-                        top_neg = combined.sort_values(by='delta').head(5)
+                        top_pos = combined.sort_values(by='delta', ascending=False).head(15)
+                        top_neg = combined.sort_values(by='delta').head(15)
                         if not top_pos.empty:
                             quarter_pair_lines.append(' Top increases:')
                             for idx, row in top_pos.iterrows():
@@ -1079,6 +1270,92 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
                                 quarter_pair_lines.append(f"  - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
                     else:
                         quarter_pair_lines.append('  Memo/description column not found; cannot compute QoQ memo-level diffs for this pair.')
+        except Exception:
+            pass
+
+    # Per-year memo analysis: if year_groups detected, perform analogous YoY memo diffs
+    if mode == 'yoy':
+        try:
+            # For YoY mode, we may collect year groups from the workbook
+            year_groups = {}
+            try:
+                xl = pd.ExcelFile(output_excel)
+                import re
+                # fallback: also include sheet named 'Yearly' to infer ordering
+                if 'Yearly' in xl.sheet_names:
+                    try:
+                        ydf = pd.read_excel(output_excel, sheet_name='Yearly')
+                        if 'YearStart' in ydf.columns:
+                            for _, r in ydf.iterrows():
+                                try:
+                                    ts = pd.to_datetime(str(r['YearStart']) + '-01')
+                                    year_groups[ts] = None
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                for s in xl.sheet_names:
+                    if re.match(r"^FY\d{4}$", s):
+                        try:
+                            df_sheet = pd.read_excel(output_excel, sheet_name=s)
+                            year_groups[s] = df_sheet
+                        except Exception:
+                            continue
+            except Exception:
+                year_groups = {}
+
+            if year_groups:
+                # determine sorted year keys: if keys are timestamps use them, else use sheet order
+                y_keys = list(year_groups.keys())
+                # if keys are timestamps, sort; otherwise keep sheet order
+                try:
+                    y_sorted_keys = sorted([k for k in y_keys if isinstance(k, (pd.Timestamp, pd.DatetimeIndex))])
+                except Exception:
+                    y_sorted_keys = y_keys
+                # if keys are strings (sheet names like FY2025), keep that order as found
+                for i in range(1, len(y_keys)):
+                    k_prev = y_keys[i-1]
+                    k_curr = y_keys[i]
+                    g_prev = year_groups.get(k_prev)
+                    g_curr = year_groups.get(k_curr)
+                    label_prev = str(k_prev)
+                    label_curr = str(k_curr)
+                    quarter_pair_lines.append(f"\nChanges {label_prev} -> {label_curr}: ")
+                    if g_prev is None or g_curr is None:
+                        quarter_pair_lines.append('  Year detail not available; skipped.')
+                        continue
+                    # detect memo column in year groups
+                    y_memo_col = None
+                    lowered = {c.lower(): c for c in g_prev.columns}
+                    for name in possible_memo_names:
+                        if name in g_prev.columns:
+                            y_memo_col = name
+                            break
+                        if name.lower() in lowered:
+                            y_memo_col = lowered[name.lower()]
+                            break
+                    if y_memo_col and y_memo_col in g_prev.columns and y_memo_col in g_curr.columns:
+                        agg_prev = g_prev.groupby(y_memo_col)[value_col].sum()
+                        agg_curr = g_curr.groupby(y_memo_col)[value_col].sum()
+                        combined = pd.concat([agg_prev.rename('prev'), agg_curr.rename('curr')], axis=1).fillna(0)
+                        combined['delta'] = combined['curr'] - combined['prev']
+                        total_delta = combined['delta'].sum()
+                        if total_delta == 0:
+                            combined['contrib_pct_of_flux'] = 0.0
+                        else:
+                            combined['contrib_pct_of_flux'] = (combined['delta'] / total_delta) * 100
+                        top_pos = combined.sort_values(by='delta', ascending=False).head(15)
+                        top_neg = combined.sort_values(by='delta').head(15)
+                        if not top_pos.empty:
+                            quarter_pair_lines.append(' Top increases:')
+                            for idx, row in top_pos.iterrows():
+                                quarter_pair_lines.append(f"  - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                        if not top_neg.empty:
+                            quarter_pair_lines.append(' Top decreases:')
+                            for idx, row in top_neg.iterrows():
+                                quarter_pair_lines.append(f"  - {idx}: delta {row['delta']:.2f} ({row.get('contrib_pct_of_flux',0.0):.1f}% of flux) (prev {row['prev']:.2f} -> curr {row['curr']:.2f})")
+                    else:
+                        quarter_pair_lines.append('  Memo/description column not found; cannot compute YoY memo-level diffs for this pair.')
         except Exception:
             pass
 
@@ -1108,6 +1385,11 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
             lines.append('\n'.join(quarter_pair_lines))
         if quarter_memo_lines:
             lines.append('\n'.join(quarter_memo_lines))
+    if mode == 'yoy':
+        if quarter_pair_lines:  # Reusing quarter_pair_lines for YoY analysis
+            lines.append('\n'.join(quarter_pair_lines))
+        if quarter_memo_lines:  # Reusing quarter_memo_lines for YoY analysis
+            lines.append('\n'.join(quarter_memo_lines))
 
     prompt = '\n'.join(lines)
     # Avoid truncating the prompt aggressively in code; rely on model max_tokens instead.
@@ -1121,7 +1403,14 @@ def perform_openai_analysis(output_excel, df_all, summary_df, api_env_var='OPENA
 
     default_model = 'gpt-5-2025-08-07'
     model = model or os.environ.get('OPENAI_MODEL') or default_model
-    mode_label = 'month-over-month' if mode == 'mom' else 'quarter-over-quarter'
+    if mode == 'mom':
+        mode_label = 'month-over-month'
+    elif mode == 'qoq':
+        mode_label = 'quarter-over-quarter'
+    elif mode == 'yoy':
+        mode_label = 'year-over-year'
+    else:
+        mode_label = 'month-over-month'
     print(f'Calling OpenAI model {model} to analyze {mode_label} fluctuations (this may incur usage). max_tokens={max_tokens or "unlimited"}')
     if dry_run:
         # return the prepared prompt for inspection without calling OpenAI
@@ -1277,12 +1566,17 @@ def main():
 
         analysis_mode = 'mom'
         if should_analyze:
-            print("Choose analysis mode: [1] Month-over-Month (MoM), [2] Quarter-over-Quarter (QoQ)")
+            print("Choose analysis mode: [1] Month-over-Month (MoM), [2] Quarter-over-Quarter (QoQ), [3] Year-over-Year (YoY)")
             try:
-                mode_choice = input('Enter 1 for MoM or 2 for QoQ (default 1): ').strip()
+                mode_choice = input('Enter 1 for MoM, 2 for QoQ, or 3 for YoY (default 1): ').strip()
             except EOFError:
                 mode_choice = ''
-            analysis_mode = 'qoq' if mode_choice == '2' else 'mom'
+            if mode_choice == '2':
+                analysis_mode = 'qoq'
+            elif mode_choice == '3':
+                analysis_mode = 'yoy'
+            else:
+                analysis_mode = 'mom'
 
         try:
             summary = summarize(input_path, sheet=default_sheet, date_col=default_date_col, value_col=default_value_col, output_excel=output_excel, include_department=include_department, department_col=department_col, include_class=include_class, class_col=class_col, fy_end_month=fy_end_month)

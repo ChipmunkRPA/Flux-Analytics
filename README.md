@@ -9,6 +9,7 @@ A comprehensive Python utility for analyzing Profit & Loss (P&L) financial data 
 - **Comprehensive Analysis**: 
   - Month-over-Month (MoM) flux and percentage changes
   - Quarter-over-Quarter (QoQ) analysis with configurable fiscal year end
+  - Year-over-Year (YoY) analysis with fiscal year consideration
   - Department and Class-level breakdowns
 - **Interactive Interface**: User-friendly prompts for configuration
 - **AI-Powered Insights**: Optional OpenAI integration for intelligent analysis
@@ -36,7 +37,7 @@ python3 PL_Flux.py
 3. **Department Analysis**: Enable department-level breakdowns (y/N)
 4. **Class Analysis**: Enable class-level breakdowns (y/N)
 5. **Fiscal Year End**: Set fiscal year end month (1-12, default: 12)
-6. **Analysis Mode**: Choose MoM or QoQ analysis (if AI enabled)
+6. **Analysis Mode**: Choose MoM, QoQ, or YoY analysis (if AI enabled)
 
 ### Required Columns
 
@@ -55,6 +56,7 @@ python3 PL_Flux.py
 
 - **Summary Sheet**: Monthly totals with MoM flux and percentage changes
 - **Quarterly Sheet**: Fiscal quarter summaries with QoQ analysis
+- **Yearly Sheet**: Fiscal year summaries with YoY analysis
 - **Monthly Sheets**: Individual transaction details for each month (YYYY-MM format)
 - **Department/Class Sheets**: Breakdowns by department and class (if enabled)
 - **AI_Analysis Sheet**: AI-generated insights (if enabled)
@@ -67,7 +69,7 @@ Detailed AI analysis of financial fluctuations and trends.
 
 The optional AI analysis provides:
 
-- **Intelligent Insights**: Explains month-over-month or quarter-over-quarter fluctuations
+- **Intelligent Insights**: Explains month-over-month, quarter-over-quarter, or year-over-year fluctuations
 - **Context-Aware Analysis**: Considers department, class, and memo information
 - **Trend Identification**: Identifies patterns and potential causes of changes
 - **Detailed Breakdowns**: Top increases/decreases by various dimensions
@@ -99,6 +101,7 @@ The tool automatically manages OpenAI API configuration:
 
 - **Month-over-Month (MoM)**: Detailed monthly trend analysis
 - **Quarter-over-Quarter (QoQ)**: Fiscal quarter analysis
+- **Year-over-Year (YoY)**: Fiscal year analysis with configurable fiscal year end
 - **Multi-dimensional**: Department and class breakdowns
 - **Pairwise Analysis**: Detailed comparison between adjacent periods
 
